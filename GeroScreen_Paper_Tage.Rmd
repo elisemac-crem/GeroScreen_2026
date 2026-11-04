@@ -1,0 +1,208 @@
+---
+title: "GeroScreen_Paper_Tage"
+output: html_document
+date: "2026-09-23"
+---
+script to redo plotting of Tage for geroscreen that nick computed 
+
+```{r}
+## =============================================================================
+## ARI GeroScreen — transcriptomic age (tAge) clocks
+## Input : tAge_GeroScreen_vehicle_cell_line.csv
+##         (per-sample tAge_Chronoage and tAge_Mortality, relative values)
+
+## ---- 0. Setup ---------------------------------------------------------------
+setwd("/restricted/projectnb/crem-trainees/Murphy_Lab/Elise/GeroScreen_Paper")
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+
+## The file contains "µ" in the concentration column, saved in Latin-1 encoding
+tage_raw <- read.csv("tAge_GeroScreen_vehicle_cell_line.csv",
+                     stringsAsFactors = FALSE, encoding = "latin1")
+
+out_dir <- "tAge_figures"
+dir.create(out_dir, showWarnings = FALSE)
+
+base_font <- "sans"
+
+## Values in the file are already relative. Set TRUE to additionally subtract
+## each line's vehicle mean, so vehicle sits exactly at 0 in both lines.
+center_on_vehicle <- FALSE
+
+## ---- 1. Sample annotation ---------------------------------------------------
+group_levels <- c("CTRL", "RUT", "SIT", "GEN", "EBS", "CAL", "PI", "TRA", "RAP")
+treatments   <- setdiff(group_levels, "CTRL")
+
+## Same colours as every other panel (Okabe-Ito, grey for vehicle)
+group_cols <- setNames(c("grey55", "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+                         "#0072B2", "#D55E00", "#CC79A7", "#000000"),
+                       group_levels)
+
+## Group taken from the sample name (e.g. "BU6_RUT1" -> "RUT")
+tage <- tage_raw %>%
+  mutate(line  = factor(cell_line),
+         group = factor(sub("[0-9]+$", "", sub("^[^_]+_", "", sample_name)),
+                        levels = group_levels))
+stopifnot(!any(is.na(tage$group)))
+print(table(tage$group, tage$line))
+
+metrics <- c(tAge_Chronoage = "Chronological tAge",
+             tAge_Mortality = "Mortality tAge")
+y_labels <- c("Chronological tAge" = "Relative chronological tAge (years)",
+              "Mortality tAge"     = "Relative mortality tAge")
+
+tage_long <- tage %>%
+  select(sample_name, line, group, all_of(names(metrics))) %>%
+  pivot_longer(all_of(names(metrics)), names_to = "metric", values_to = "value") %>%
+  mutate(metric = factor(metrics[metric], levels = metrics))
+
+if (center_on_vehicle) {
+  tage_long <- tage_long %>%
+    group_by(metric, line) %>%
+    mutate(value = value - mean(value[group == "CTRL"])) %>%
+    ungroup()
+}
+
+write.csv(tage_long, file.path(out_dir, "tAge_values_long.csv"), row.names = FALSE)
+
+## ---- 2. Statistics: value ~ group + line, each treatment vs vehicle ----------
+tage_stats <- tage_long %>%
+  group_by(metric) %>%
+  group_modify(~ {
+    m  <- summary(lm(value ~ group + line, data = .x))$coefficients
+    rn <- paste0("group", treatments)
+    data.frame(treatment = treatments,
+               estimate  = m[rn, "Estimate"],
+               se        = m[rn, "Std. Error"],
+               P.Value   = m[rn, "Pr(>|t|)"])
+  }) %>%
+  mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%  # across 8 treatments
+  ungroup()
+write.csv(tage_stats, file.path(out_dir, "tAge_stats_vs_vehicle.csv"), row.names = FALSE)
+
+p_to_star <- function(p) {
+  as.character(cut(p, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                   labels = c("***", "**", "*", ""), right = FALSE))
+}
+
+## Star positions: just above the highest point in each facet/group
+star_df <- tage_long %>%
+  group_by(metric) %>%
+  mutate(rng = diff(range(value))) %>%
+  group_by(metric, group) %>%
+  summarise(y = max(value) + 0.12 * first(rng), .groups = "drop") %>%
+  inner_join(tage_stats %>%
+               transmute(metric, group = factor(treatment, levels = group_levels),
+                         label = p_to_star(adj.P.Val)),
+             by = c("metric", "group"))
+
+## ---- 3. Plot (same style as the mTORC1 / MEK-ERK score figure) ---------------
+theme_screen <- theme_bw(base_size = 12, base_family = base_font) +
+  theme(panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_blank(),
+        strip.background   = element_rect(fill = "grey92"),
+        strip.text         = element_text(face = "bold"),
+        axis.text.x        = element_text(angle = 45, hjust = 1),
+        legend.position    = "right")
+
+make_tage_plot <- function(dat, stars, y_lab, title, subtitle) {
+  ggplot(dat, aes(group, value)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.25) +
+    stat_summary(aes(colour = group), fun = mean, geom = "crossbar",
+                 width = 0.5, linewidth = 0.3) +
+    geom_point(aes(colour = group, shape = line), size = 2,
+               position = position_jitter(width = 0.12, height = 0, seed = 1)) +
+    geom_text(data = stars, aes(y = y, label = label), size = 5) +
+    facet_wrap(~ metric, scales = "free_y") +
+    scale_colour_manual(values = group_cols, guide = "none") +
+    scale_shape_manual(values = c(16, 17), name = "Line") +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.12))) +
+    labs(x = NULL, y = y_lab, title = title, subtitle = subtitle) +
+    theme_screen
+}
+
+stat_subtitle <- "Stars = lm(value ~ group + line) vs CTRL, BH-adjusted across treatments"
+
+## Combined figure: both clocks side by side
+p_both <- make_tage_plot(tage_long, star_df,
+                         y_lab = "Relative tAge",
+                         title = "Transcriptomic age (tAge)",
+                         subtitle = stat_subtitle)
+
+## Individual figures
+p_chrono <- make_tage_plot(filter(tage_long, metric == "Chronological tAge"),
+                           filter(star_df, metric == "Chronological tAge"),
+                           y_lab = y_labels["Chronological tAge"],
+                           title = "Chronological tAge",
+                           subtitle = stat_subtitle)
+p_mort   <- make_tage_plot(filter(tage_long, metric == "Mortality tAge"),
+                           filter(star_df, metric == "Mortality tAge"),
+                           y_lab = y_labels["Mortality tAge"],
+                           title = "Mortality tAge",
+                           subtitle = stat_subtitle)
+
+## ---- 4. Save (cairo for both PNG and PDF) ------------------------------------
+save_fig <- function(p, name, w, h) {
+  ggsave(file.path(out_dir, paste0(name, ".png")), p, width = w, height = h,
+         units = "in", dpi = 600, device = png, type = "cairo")
+  ggsave(file.path(out_dir, paste0(name, ".pdf")), p, width = w, height = h,
+         units = "in", device = cairo_pdf)
+}
+save_fig(p_both,   "tAge_chrono_and_mortality", 9,   4.5)
+save_fig(p_chrono, "tAge_chronological",        5.5, 4.5)
+save_fig(p_mort,   "tAge_mortality",            5.5, 4.5)
+
+## ---- 5. Session info ----------------------------------------------------------
+## ---- 5. Per-line figure: each clock x each cell line ------------------------
+## Rows = clock, columns = cell line. Each row shares one y-axis across BU6 and
+## BU8 so the two lines can be compared directly. No stars here: within one
+## line there are only 2 technical replicates per compound, too few for a
+## meaningful test (the line-adjusted statistics are in the combined figure).
+tage_line <- tage_long %>%
+  mutate(line = factor(line, levels = c("BU6", "BU8")))
+ 
+p_by_line <- ggplot(tage_line, aes(group, value)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.25) +
+  stat_summary(aes(colour = group), fun = mean, geom = "crossbar",
+               width = 0.5, linewidth = 0.3) +
+  geom_point(aes(colour = group, shape = line), size = 2,
+             position = position_jitter(width = 0.12, height = 0, seed = 1)) +
+  facet_grid(metric ~ line, scales = "free_y") +
+  scale_colour_manual(values = group_cols, guide = "none") +
+  scale_shape_manual(values = c(BU6 = 16, BU8 = 17), guide = "none") +  # panels already labelled by line
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.08))) +
+  labs(x = NULL, y = "Relative tAge",
+       title = "Transcriptomic age by cell line",
+       subtitle = "Mean \u00b1 SEM of 2 technical replicates per compound") +
+  theme_screen
+ 
+save_fig(p_by_line, "tAge_by_cell_line", 9, 7)
+
+## ---- 6. Per-line figure: chronological tAge only -----------------------------
+## BU6 and BU8 side by side, shared y-axis, same style as section 5
+p_chrono_by_line <- ggplot(filter(tage_line, metric == "Chronological tAge"),
+                           aes(group, value)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.25) +
+  stat_summary(aes(colour = group), fun = mean, geom = "crossbar",
+               width = 0.5, linewidth = 0.3) +
+  geom_point(aes(colour = group, shape = line), size = 2,
+             position = position_jitter(width = 0.12, height = 0, seed = 1)) +
+  facet_wrap(~ line, nrow = 1) +
+  scale_colour_manual(values = group_cols, guide = "none") +
+  scale_shape_manual(values = c(BU6 = 16, BU8 = 17), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.08))) +
+  labs(x = NULL, y = "Relative chronological tAge (years)",
+       title = "Chronological tAge by cell line",
+       subtitle = "Mean \u00b1 SEM of 2 technical replicates per compound") +
+  theme_screen
+ 
+save_fig(p_chrono_by_line, "tAge_chronological_by_cell_line", 9, 4.5)
+```
+

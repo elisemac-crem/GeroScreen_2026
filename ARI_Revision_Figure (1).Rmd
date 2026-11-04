@@ -1,0 +1,408 @@
+---
+title: "ARI_Revision_Figure"
+output: html_document
+date: "2026-10-28"
+---
+
+This script was written to address T. Girke comment on the manuscript, "Explore the weaker ARI responses. For compounds with few individually significant ARI changes, could a combined analysis (focus on logFC without FDR) reveal a consistent response across several indicators? This might help distinguish a weak but coordinated response from no clear response. A plot of changes with confidence intervals could also help show whether these results reflect small effects or substantial uncertainty."
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+ Approach:
+   1. Score each ARI per sample (gene ARIs = logCPM; pathway ARIs = mean z-score
+      across signature genes, as in Figure 2b-c).
+   2. Estimate each compound's effect on each ARI vs vehicle with
+      lm(value ~ treatment + line), reported with 95% CI and NO FDR filter.
+   3. Standardize each effect by that indicator's residual SD and sign-align it
+      so that positive = slow-aging direction for every indicator.
+   4. Build a per-sample composite ARI score (mean of aligned, standardized
+      indicators) and test it with the same model, giving one effect +/- CI
+      per compound. Done for all six ARIs and for the four transcript-level
+      ARIs alone (so mTORC1 / MEK-ERK do not dominate).
+   5. Count how many indicators move in the slow-aging direction (sign test).
+   6. Classify each compound: coordinated slow-aging / coordinated opposite /
+      no detectable response (CI inside +/- margin) / uncertain (CI wide).
+
+ Outputs (in out_dir):
+   FigS_ARI_forest_standardized.png/.pdf  per-indicator effects, 95% CI
+   FigS_ARI_forest_native_units.png/.pdf  same, in log2FC / score units
+   FigS_ARI_composite.png/.pdf             composite effect per compound
+   ARI_indicator_effects.csv, ARI_composite_effects.csv
+   
+   
+#0 -- Setup 
+
+```{r}
+setwd("/restricted/projectnb/crem-trainees/Murphy_Lab/Elise/GeroScreen_Paper")
+ 
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+ 
+out_dir <- "ARI_combined"
+dir.create(out_dir, showWarnings = FALSE)
+ 
+base_font <- "sans"     # Arial is not available on the SCC
+ 
+## Equivalence margin (in residual-SD units) used to call "no detectable
+## response": the whole 95% CI must sit inside +/- this value.
+## 0.5 SD is a conventional "small effect" boundary; change if you prefer.
+equiv_margin <- 0.5
+ 
+logcpm_raw <- read.csv("26_01_29_logcpm.csv", check.names = FALSE,
+                       stringsAsFactors = FALSE)
+ 
+annot_cols  <- c("gene_key", "gene_id", "symbol", "feature_name",
+                 "Length", "gene_biotype")
+sample_cols <- setdiff(colnames(logcpm_raw), annot_cols)
+```
+
+#1 -- Sample meta data (same as other scripts for this manuscript)
+
+```{r}
+group_levels <- c("CTRL", "RUT", "SIT", "GEN", "EBS", "CAL", "PI", "TRA", "RAP")
+full_names   <- c(CTRL = "Vehicle", RUT = "Rutin", SIT = "Sitagliptin",
+                  GEN = "Genistein", EBS = "Ebselen", CAL = "Calpeptin",
+                  PI = "PI-103", TRA = "Trametinib", RAP = "Rapamycin")
+treatments   <- setdiff(group_levels, "CTRL")
+ 
+meta <- data.frame(sample = sample_cols, stringsAsFactors = FALSE) %>%
+  mutate(line  = factor(sub("_.*$", "", sample)),
+         cond  = sub("^[^_]+_", "", sample),
+         group = factor(sub("[0-9]+$", "", cond), levels = group_levels),
+         label = factor(full_names[as.character(group)],
+                        levels = full_names[group_levels]))
+stopifnot(!any(is.na(meta$group)))
+ 
+## Okabe-Ito, grey for vehicle (identical to Figures 1-2)
+group_cols <- setNames(c("grey55", "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+                         "#0072B2", "#D55E00", "#CC79A7", "#000000"),
+                       full_names[group_levels])
+```
+
+#2 -- Expression matrix
+
+```{r}
+expr_df <- logcpm_raw %>%
+  filter(!is.na(symbol), symbol != "") %>%
+  mutate(row_mean = rowMeans(across(all_of(sample_cols)))) %>%
+  group_by(symbol) %>%
+  slice_max(row_mean, n = 1, with_ties = FALSE) %>%
+  ungroup()
+ 
+expr <- as.matrix(expr_df[, meta$sample])
+rownames(expr) <- expr_df$symbol
+```
+
+#3 -- Theme and save helped (same as previous scripts for this manuscript)
+
+```{r}
+theme_fig <- theme_classic(base_size = 9, base_family = base_font) +
+  theme(axis.text        = element_text(colour = "black"),
+        axis.line        = element_line(linewidth = 0.4),
+        axis.ticks       = element_line(linewidth = 0.4),
+        strip.background = element_blank(),
+        strip.text       = element_text(face = "bold"),
+        legend.key.size  = unit(0.35, "cm"),
+        plot.title       = element_text(face = "bold", size = 10))
+ 
+save_fig <- function(p, name, w, h) {
+  ggsave(file.path(out_dir, paste0(name, ".png")), p, width = w, height = h,
+         units = "in", dpi = 600, device = png, type = "cairo")
+  ggsave(file.path(out_dir, paste0(name, ".pdf")), p, width = w, height = h,
+         units = "in", device = cairo_pdf)
+}
+```
+
+#4 -- Define ARI parametrs 
+
+```{r}
+## direction = +1 if the slow-aging state is an INCREASE, -1 if a DECREASE
+## (Austad, Kaeberlein & Miller 2026; Figure 2 legend).
+gene_aris <- data.frame(
+  indicator = c("DCX", "BDNF", "FNDC5", "GPLD1", "UCP1"),
+  direction = c(+1, +1, +1, +1, +1),
+  stringsAsFactors = FALSE
+)
+missing_genes <- setdiff(gene_aris$indicator, rownames(expr))
+if (length(missing_genes) > 0) {
+  message("Not expressed / filtered, skipped: ",
+          paste(missing_genes, collapse = ", "))
+}
+gene_aris <- filter(gene_aris, indicator %in% rownames(expr))
+ 
+## MEK-ERK: 10-gene MAPK Pathway Activity Score (Wagle et al. 2018)
+mpas_genes <- c("PHLDA1", "SPRY2", "SPRY4", "DUSP4", "DUSP6",
+                "CCND1", "EPHA2", "EPHA4", "ETV4", "ETV5")
+ 
+## mTORC1: MSigDB Hallmark mTORC1 signalling (same set as Figure 2b)
+if (!requireNamespace("msigdbr", quietly = TRUE)) {
+  stop("msigdbr is needed for the Hallmark mTORC1 set (as in Figure 2b).")
+}
+hm <- tryCatch(
+  msigdbr::msigdbr(species = "Homo sapiens", collection = "H"),
+  error = function(e) msigdbr::msigdbr(species = "Homo sapiens", category = "H")
+)
+mtorc1_genes <- unique(hm$gene_symbol[hm$gs_name == "HALLMARK_MTORC1_SIGNALING"])
+ 
+pathway_score <- function(genes) {
+  g <- intersect(genes, rownames(expr))
+  message(sprintf("  %d of %d signature genes found", length(g), length(genes)))
+  z <- t(scale(t(expr[g, , drop = FALSE])))   # z-score each gene across samples
+  colMeans(z, na.rm = TRUE)
+}
+ 
+message("MEK-ERK (MPAS):");  mek_score    <- pathway_score(mpas_genes)
+message("mTORC1 (Hallmark):"); mtorc1_score <- pathway_score(mtorc1_genes)
+```
+
+#5 -- Per sample indicators 
+
+```{r}
+ari_long <- bind_rows(
+  lapply(gene_aris$indicator, function(g)
+    data.frame(sample = meta$sample, indicator = g, value = expr[g, meta$sample])),
+  data.frame(sample = meta$sample, indicator = "mTORC1",  value = mtorc1_score[meta$sample]),
+  data.frame(sample = meta$sample, indicator = "MEK-ERK", value = mek_score[meta$sample])
+) %>%
+  left_join(meta, by = "sample")
+ 
+ari_info <- bind_rows(
+  gene_aris %>% mutate(class = "Transcript-level"),
+  data.frame(indicator = c("mTORC1", "MEK-ERK"), direction = c(-1, -1),
+             class = "Pathway-level")
+)
+ari_levels <- ari_info$indicator
+ari_long   <- left_join(ari_long, ari_info, by = "indicator")
+```
+
+#6 -- Per indicator effects vs. vehicle, no FDR, 95% CI
+
+```{r}
+fit_indicator <- function(d) {
+  d$group <- relevel(droplevels(d$group), ref = "CTRL")
+  fit <- lm(value ~ group + line, data = d)
+  co  <- summary(fit)$coefficients
+  ci  <- confint(fit)
+  rows <- paste0("group", treatments)
+  data.frame(group     = treatments,
+             estimate  = co[rows, "Estimate"],
+             se        = co[rows, "Std. Error"],
+             lower     = ci[rows, 1],
+             upper     = ci[rows, 2],
+             p_nominal = co[rows, "Pr(>|t|)"],
+             resid_sd  = sigma(fit),
+             df        = fit$df.residual)
+}
+ 
+ind_eff <- ari_long %>%
+  group_by(indicator, direction, class) %>%
+  group_modify(~ fit_indicator(.x)) %>%
+  ungroup() %>%
+  mutate(
+    ## standardized and sign-aligned: + = slow-aging direction, in SD units
+    std_est   = direction * estimate / resid_sd,
+    std_lower = direction * ifelse(direction > 0, lower, upper) / resid_sd,
+    std_upper = direction * ifelse(direction > 0, upper, lower) / resid_sd,
+    label     = factor(full_names[group], levels = full_names[treatments]),
+    indicator = factor(indicator, levels = ari_levels),
+    nominal_sig = p_nominal < 0.05
+  )
+ 
+write.csv(ind_eff, file.path(out_dir, "ARI_indicator_effects.csv"),
+          row.names = FALSE)
+```
+
+#7 -- Composite ARI score per sample
+
+```{r}
+## For each indicator: centre on the vehicle mean within each line, divide by the
+## indicator's residual SD, multiply by direction. Composite = mean across
+## indicators within a sample. Fitting the composite per sample (rather than
+## averaging the effect estimates) keeps the correlation between indicators
+## inside the uncertainty estimate.
+sd_lookup <- ind_eff %>% distinct(indicator, resid_sd) %>%
+  mutate(indicator = as.character(indicator))
+ 
+ari_std <- ari_long %>%
+  group_by(indicator, line) %>%
+  mutate(veh_mean = mean(value[group == "CTRL"])) %>%
+  ungroup() %>%
+  left_join(sd_lookup, by = "indicator") %>%
+  mutate(aligned = direction * (value - veh_mean) / resid_sd)
+ 
+composite_sets <- list(
+  "All ARIs"              = ari_levels,
+  "Transcript-level ARIs" = gene_aris$indicator
+)
+ 
+comp_eff <- bind_rows(lapply(names(composite_sets), function(nm) {
+  inds <- composite_sets[[nm]]
+  per_sample <- ari_std %>%
+    filter(indicator %in% inds) %>%
+    group_by(sample, group, line, label) %>%
+    summarise(composite = mean(aligned), .groups = "drop") %>%
+    mutate(group = relevel(droplevels(group), ref = "CTRL"))
+  fit <- lm(composite ~ group + line, data = per_sample)
+  co  <- summary(fit)$coefficients
+  ci  <- confint(fit)
+  rows <- paste0("group", treatments)
+  data.frame(set       = nm,
+             n_ind     = length(inds),
+             group     = treatments,
+             estimate  = co[rows, "Estimate"],
+             lower     = ci[rows, 1],
+             upper     = ci[rows, 2],
+             p_nominal = co[rows, "Pr(>|t|)"])
+}))
+ 
+## Directional consistency: how many indicators point the slow-aging way?
+concord <- bind_rows(lapply(names(composite_sets), function(nm) {
+  ind_eff %>%
+    filter(indicator %in% composite_sets[[nm]]) %>%
+    group_by(group) %>%
+    summarise(n_slow  = sum(std_est > 0),
+              n_total = n(), .groups = "drop") %>%
+    mutate(set = nm,
+           sign_p = mapply(function(k, n)
+             binom.test(k, n, 0.5, alternative = "two.sided")$p.value,
+             n_slow, n_total))
+}))
+ 
+comp_eff <- comp_eff %>%
+  left_join(concord, by = c("set", "group")) %>%
+  mutate(
+    label = factor(full_names[group], levels = full_names[treatments]),
+    set   = factor(set, levels = names(composite_sets)),
+    call  = case_when(
+      lower > 0                                        ~ "Coordinated, slow-aging direction",
+      upper < 0                                        ~ "Coordinated, opposite direction",
+      lower > -equiv_margin & upper < equiv_margin     ~ "No detectable response",
+      TRUE                                             ~ "Uncertain (wide CI)"
+    ),
+    ci_width = upper - lower
+  )
+ 
+write.csv(comp_eff, file.path(out_dir, "ARI_composite_effects.csv"),
+          row.names = FALSE)
+ 
+message("\nComposite ARI effects (SD units, + = slow-aging direction):")
+print(comp_eff %>%
+        transmute(set, compound = label,
+                  estimate = round(estimate, 2),
+                  CI = sprintf("[%.2f, %.2f]", lower, upper),
+                  slow_dir = paste0(n_slow, "/", n_total),
+                  call),
+      row.names = FALSE)
+```
+
+#8 -- Figure 1, per indicator forest plot 
+
+```{r}
+## Compound order top-to-bottom matches Table 1
+y_order <- rev(full_names[treatments])
+ 
+strip_lab <- setNames(
+  paste0(ari_info$indicator, "\n(slow-aging: ",
+         ifelse(ari_info$direction > 0, "up", "down"), ")"),
+  ari_info$indicator)
+ 
+p_forest <- ggplot(ind_eff,
+                   aes(x = std_est, y = factor(label, levels = y_order),
+                       colour = label)) +
+  annotate("rect", xmin = -equiv_margin, xmax = equiv_margin,
+           ymin = -Inf, ymax = Inf, fill = "grey92") +
+  geom_vline(xintercept = 0, linewidth = 0.3, linetype = "dashed") +
+  geom_errorbar(orientation = "y", aes(xmin = std_lower, xmax = std_upper),
+                 width = 0, linewidth = 0.5) +
+  geom_point(aes(shape = nominal_sig), size = 1.8, fill = "white") +
+  scale_colour_manual(values = group_cols, guide = "none") +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 21),
+                     labels = c(`TRUE` = "p < 0.05 (nominal)",
+                                `FALSE` = "Not significant"),
+                     name = NULL) +
+  facet_grid(. ~ indicator, scales = "free_x",
+             labeller = labeller(indicator = strip_lab)) +
+  labs(x = "Effect vs vehicle (SD units; + = slow-aging direction)",
+       y = NULL) +
+  theme_fig +
+  theme(legend.position = "bottom",
+        panel.spacing.x = unit(0.4, "cm"))
+
+p_forest
+ 
+save_fig(p_forest, "FigS_ARI_forest_standardized",
+         w = 1.15 * length(ari_levels) + 1.2, h = 3.4)
+```
+
+#9 and 10 -- additional figures
+
+```{r}
+native_lab <- setNames(
+  paste0(ari_info$indicator, "\n",
+         ifelse(ari_info$class == "Transcript-level",
+                "log2 FC", "Δ score (z)")),
+  ari_info$indicator)
+ 
+p_native <- ggplot(ind_eff,
+                   aes(x = estimate, y = factor(label, levels = y_order),
+                       colour = label)) +
+  geom_vline(xintercept = 0, linewidth = 0.3, linetype = "dashed") +
+  geom_errorbar(orientation = "y", aes(xmin = lower, xmax = upper), width = 0, linewidth = 0.5) +
+  geom_point(aes(shape = nominal_sig), size = 1.8, fill = "white") +
+  scale_colour_manual(values = group_cols, guide = "none") +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 21),
+                     labels = c(`TRUE` = "p < 0.05 (nominal)",
+                                `FALSE` = "Not significant"),
+                     name = NULL) +
+  facet_grid(. ~ indicator, scales = "free_x",
+             labeller = labeller(indicator = native_lab)) +
+  labs(x = "Effect vs vehicle (native units)", y = NULL) +
+  theme_fig +
+  theme(legend.position = "bottom",
+        panel.spacing.x = unit(0.4, "cm"))
+
+p_native
+ 
+save_fig(p_native, "FigS_ARI_forest_native_units",
+         w = 1.15 * length(ari_levels) + 1.2, h = 3.4)
+ 
+## ---- 10. Figure: composite ARI effect per compound --------------------------
+set_lab <- setNames(
+  sprintf("%s (n = %d)", names(composite_sets), lengths(composite_sets)),
+  names(composite_sets))
+ 
+p_comp <- ggplot(comp_eff,
+                 aes(x = estimate, y = factor(label, levels = y_order),
+                     colour = label)) +
+  annotate("rect", xmin = -equiv_margin, xmax = equiv_margin,
+           ymin = -Inf, ymax = Inf, fill = "grey92") +
+  geom_vline(xintercept = 0, linewidth = 0.3, linetype = "dashed") +
+  geom_errorbar(orientation = "y", aes(xmin = lower, xmax = upper), width = 0, linewidth = 0.6) +
+  geom_point(size = 2.2) +
+  ## indicators in the slow-aging direction, printed just outside each panel
+  geom_text(aes(x = Inf, label = paste0(n_slow, "/", n_total)),
+            hjust = -0.3, size = 2.6, colour = "black", family = base_font) +
+  scale_colour_manual(values = group_cols, guide = "none") +
+  facet_grid(. ~ set, labeller = labeller(set = set_lab)) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Composite ARI shift vs vehicle\n(mean SD units; + = slow-aging direction)",
+       y = NULL,
+       caption = "Right of each panel: indicators shifted in the slow-aging direction") +
+  theme_fig +
+  theme(panel.spacing.x = unit(1.1, "cm"),
+        plot.margin     = margin(5.5, 28, 5.5, 5.5),
+        plot.caption    = element_text(size = 7, colour = "grey30"))
+
+p_comp
+ 
+save_fig(p_comp, "FigS_ARI_composite", w = 5.6, h = 3.1)
+```
+
+
+
+

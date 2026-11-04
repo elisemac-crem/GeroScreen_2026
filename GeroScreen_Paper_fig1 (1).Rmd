@@ -1,0 +1,936 @@
+---
+title: "GeroScreen_Paper"
+output: html_document
+date: "2026-09-23"
+---
+
+Setup wd, download libraries, read in log cpm file 
+
+```{r}
+setwd("/restricted/projectnb/crem-trainees/Murphy_Lab/Elise/GeroScreen_Paper")
+ 
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(limma)
+})
+ 
+out_dir <- "Fig1_exploratory"
+dir.create(out_dir, showWarnings = FALSE)
+ 
+## Analysis settings
+n_var_genes <- 500    # most variable genes used for PCA
+fdr_cut     <- 0.05   # DEG threshold (BH-adjusted p)
+lfc_cut     <- 0      # optional |log2FC| threshold for DEG counts (e.g. 0.5)
+ 
+## Default sans font (Arial is not installed on the SCC)
+base_font <- "sans"
+use_ragg <- requireNamespace("ragg", quietly = TRUE)
+ 
+logcpm_raw <- read.csv("26_01_29_logcpm.csv", check.names = FALSE,
+                       stringsAsFactors = FALSE)
+ 
+annot_cols  <- c("gene_key", "gene_id", "symbol", "feature_name",
+                 "Length", "gene_biotype")
+sample_cols <- setdiff(colnames(logcpm_raw), annot_cols)
+```
+
+sample meta data 
+```{r}
+group_levels <- c("CTRL", "RUT", "SIT", "GEN", "EBS", "CAL", "PI", "TRA", "RAP")
+full_names   <- c(CTRL = "Vehicle", RUT = "Rutin", SIT = "Sitagliptin",
+                  GEN = "Genistein", EBS = "Ebselen", CAL = "Calpeptin",
+                  PI = "PI-103", TRA = "Trametinib", RAP = "Rapamycin")
+ 
+meta <- data.frame(sample = sample_cols, stringsAsFactors = FALSE) %>%
+  mutate(line  = factor(sub("_.*$", "", sample)),
+         cond  = sub("^[^_]+_", "", sample),
+         group = factor(sub("[0-9]+$", "", cond), levels = group_levels),
+         rep   = sub("^.*?([0-9]+)$", "\\1", cond),
+         label = factor(full_names[as.character(group)],
+                        levels = full_names[group_levels]))
+stopifnot(!any(is.na(meta$group)))
+ 
+treatments <- setdiff(group_levels, "CTRL")
+ 
+## Same colours as the pathway-score figure (Okabe-Ito, grey for vehicle)
+group_cols <- setNames(c("grey55", "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+                         "#0072B2", "#D55E00", "#CC79A7", "#000000"),
+                       full_names[group_levels])
+```
+
+set up expression matrix 
+```{r}
+## Rows keyed by Ensembl ID so no genes are lost to duplicate symbols
+expr <- as.matrix(logcpm_raw[, meta$sample])
+rownames(expr) <- logcpm_raw$gene_id
+symbol_lookup  <- setNames(logcpm_raw$symbol, logcpm_raw$gene_id)
+```
+
+set theme and spots to save 
+```{r}
+theme_fig <- theme_classic(base_size = 9, base_family = base_font) +
+  theme(axis.text        = element_text(colour = "black"),
+        axis.line        = element_line(linewidth = 0.4),
+        axis.ticks       = element_line(linewidth = 0.4),
+        strip.background = element_blank(),
+        strip.text       = element_text(face = "bold"),
+        legend.key.size  = unit(0.35, "cm"),
+        plot.title       = element_text(face = "bold", size = 10))
+ 
+save_fig <- function(p, name, w, h) {
+  if (use_ragg) {
+    ggsave(file.path(out_dir, paste0(name, ".png")), p, width = w, height = h,
+           units = "in", dpi = 600, device = ragg::agg_png)
+  } else {
+    ggsave(file.path(out_dir, paste0(name, ".png")), p, width = w, height = h,
+           units = "in", dpi = 600)
+  }
+  ggsave(file.path(out_dir, paste0(name, ".pdf")), p, width = w, height = h,
+         units = "in", device = cairo_pdf)
+}
+```
+
+Run PCA 
+```{r}
+run_pca <- function(mat, n_genes) {
+  vars <- apply(mat, 1, var)
+  top  <- names(sort(vars, decreasing = TRUE))[seq_len(min(n_genes, nrow(mat)))]
+  pc   <- prcomp(t(mat[top, ]), center = TRUE, scale. = FALSE)
+  pve  <- 100 * pc$sdev^2 / sum(pc$sdev^2)
+  list(scores = data.frame(pc$x[, 1:4], sample = rownames(pc$x)) %>%
+         left_join(meta, by = "sample"),
+       pve = pve)
+}
+ 
+pca_plot <- function(pca, title) {
+  ggplot(pca$scores, aes(PC1, PC2, colour = label, shape = line)) +
+    geom_point(size = 2.2, alpha = 0.9) +
+    scale_colour_manual(values = group_cols, name = "Treatment") +
+    scale_shape_manual(values = c(16, 17), name = "Line") +
+    labs(x = sprintf("PC1 (%.1f%%)", pca$pve[1]),
+         y = sprintf("PC2 (%.1f%%)", pca$pve[2]),
+         title = title) +
+    theme_fig
+}
+
+## 4a. Uncorrected — expected to separate mainly by line
+pca_raw <- run_pca(expr, n_var_genes)
+p_pca_raw <- pca_plot(pca_raw, "All samples")
+save_fig(p_pca_raw, "Fig1A_PCA_uncorrected", 4.2, 3.2)
+
+p_pca_raw
+ 
+## 4b. Line effect removed (treatment effects preserved via the design)
+expr_corr <- removeBatchEffect(expr, batch = meta$line,
+                               design = model.matrix(~ group, data = meta))
+pca_corr <- run_pca(expr_corr, n_var_genes)
+p_pca_corr <- pca_plot(pca_corr, "Genetic background effect removed")
+save_fig(p_pca_corr, "Fig1B_PCA_line_corrected", 4.2, 3.2)
+
+
+```
+
+DEGs treatment groups vs ctrl 
+
+```{r}
+## 5a. Pooled model: each treatment vs vehicle, blocked on line
+design <- model.matrix(~ 0 + group + line, data = meta)
+colnames(design) <- make.names(sub("^group", "", colnames(design)))
+contr <- makeContrasts(contrasts = paste0(make.names(treatments), " - CTRL"),
+                       levels = design)
+colnames(contr) <- treatments
+ 
+fit_lm <- lmFit(expr, design)
+fit_c  <- eBayes(contrasts.fit(fit_lm, contr), trend = TRUE, robust = TRUE)
+ 
+de_pooled <- bind_rows(lapply(treatments, function(tx) {
+  topTable(fit_c, coef = tx, number = Inf, sort.by = "none") %>%
+    mutate(gene_id = rownames(.), symbol = symbol_lookup[gene_id],
+           treatment = tx)
+}))
+write.csv(de_pooled, file.path(out_dir, "limma_pooled_vs_vehicle_all_genes.csv"),
+          row.names = FALSE)
+ 
+## 5b. Per-line model: each treatment vs vehicle within BU6 and within BU8
+meta$line_group <- factor(paste(meta$line, meta$group, sep = "_"))
+design_l <- model.matrix(~ 0 + line_group, data = meta)
+colnames(design_l) <- sub("^line_group", "", colnames(design_l))
+ 
+line_contrasts <- unlist(lapply(levels(meta$line), function(l)
+  paste0(l, "_", treatments, " - ", l, "_CTRL")))
+contr_l <- makeContrasts(contrasts = line_contrasts, levels = design_l)
+colnames(contr_l) <- sub(" - .*$", "", line_contrasts)
+ 
+fit_l <- eBayes(contrasts.fit(lmFit(expr, design_l), contr_l),
+                trend = TRUE, robust = TRUE)
+lfc_by_line <- as.data.frame(fit_l$coefficients) %>%
+  mutate(gene_id = rownames(.)) %>%
+  pivot_longer(-gene_id, names_to = "contrast", values_to = "logFC") %>%
+  separate(contrast, into = c("line", "treatment"), sep = "_") %>%
+  pivot_wider(names_from = line, values_from = logFC)
+```
+
+DEG counts 
+
+```{r}
+deg_counts <- de_pooled %>%
+  filter(adj.P.Val < fdr_cut, abs(logFC) > lfc_cut) %>%
+  mutate(direction = ifelse(logFC > 0, "Up", "Down")) %>%
+  count(treatment, direction) %>%
+  complete(treatment = treatments, direction = c("Up", "Down"),
+           fill = list(n = 0)) %>%
+  mutate(label = factor(full_names[treatment], levels = full_names[treatments]),
+         direction = factor(direction, levels = c("Up", "Down")),
+         n_signed = ifelse(direction == "Down", -n, n))
+write.csv(deg_counts %>% select(treatment, direction, n),
+          file.path(out_dir, "DEG_counts.csv"), row.names = FALSE)
+ 
+deg_lim <- max(abs(deg_counts$n_signed)) * 1.18
+p_deg <- ggplot(deg_counts, aes(label, n_signed, fill = direction)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  geom_text(aes(label = n, vjust = ifelse(direction == "Up", -0.4, 1.3)),
+            size = 2.6, family = base_font) +
+  scale_fill_manual(values = c(Up = "#B2182B", Down = "#2166AC"), name = NULL) +
+  scale_y_continuous(labels = abs, limits = c(-deg_lim, deg_lim)) +
+  labs(x = NULL, y = "DEGs vs vehicle",
+       title = sprintf("Differentially expressed genes (FDR < %.2f)", fdr_cut)) +
+  theme_fig +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_deg
+
+save_fig(p_deg, "Fig1C_DEG_counts", 4.2, 3.2)
+```
+
+Cross line concordance 
+
+```{r}
+## Genes are SELECTED in one line and their effect is MEASURED in the other,
+## so the correlation is not inflated by selecting on the pooled result.
+## Main panel: top n_conc genes by BU6 p-value, plotted against BU8.
+## The reverse direction (selected in BU8) is reported in the CSV.
+n_conc <- 500
+ 
+top_by_line <- function(sel_line) {
+  bind_rows(lapply(treatments, function(tx) {
+    topTable(fit_l, coef = paste0(sel_line, "_", tx), number = n_conc,
+             sort.by = "P") %>%
+      transmute(gene_id = rownames(.), treatment = tx)
+  }))
+}
+ 
+conc_df <- top_by_line("BU6") %>%
+  left_join(lfc_by_line, by = c("gene_id", "treatment")) %>%
+  mutate(label = factor(full_names[treatment], levels = full_names[treatments]))
+ 
+conc_rev <- top_by_line("BU8") %>%
+  left_join(lfc_by_line, by = c("gene_id", "treatment")) %>%
+  group_by(treatment) %>%
+  summarise(r_selected_in_BU8 = cor(BU6, BU8), .groups = "drop")
+ 
+conc_r <- conc_df %>%
+  group_by(treatment, label) %>%
+  summarise(r = cor(BU6, BU8), .groups = "drop") %>%
+  mutate(txt = sprintf("r = %.2f", r))
+ 
+write.csv(conc_r %>% select(treatment, r_selected_in_BU6 = r) %>%
+            left_join(conc_rev, by = "treatment"),
+          file.path(out_dir, "line_concordance_r.csv"), row.names = FALSE)
+ 
+ax_lim <- quantile(abs(c(conc_df$BU6, conc_df$BU8)), 0.995)
+p_conc <- ggplot(conc_df, aes(BU6, BU8)) +
+  geom_hline(yintercept = 0, colour = "grey75", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey75", linewidth = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey50", linewidth = 0.3) +
+  geom_point(aes(colour = label), size = 0.5, alpha = 0.5) +
+  geom_text(data = conc_r, aes(label = txt), x = -ax_lim, y = ax_lim,
+            hjust = 0, vjust = 1, size = 2.3, lineheight = 0.9,
+            family = base_font) +
+  facet_wrap(~ label, nrow = 2) +
+  scale_colour_manual(values = group_cols, guide = "none") +
+  coord_equal(xlim = c(-ax_lim, ax_lim), ylim = c(-ax_lim, ax_lim)) +
+  labs(x = expression(BU6~log[2]*FC~vs~vehicle),
+       y = expression(BU8~log[2]*FC~vs~vehicle),
+       title = sprintf("Cross-line reproducibility (top %d genes selected in BU6)", n_conc)) +
+  theme_fig +
+  theme(panel.border = element_rect(fill = NA, linewidth = 0.4))
+
+p_conc
+
+save_fig(p_conc, "Fig1D_line_concordance", 7, 3.9)
+```
+
+sample-sample correlation heat map 
+```{r}
+top_var <- names(sort(apply(expr_corr, 1, var), decreasing = TRUE))[1:n_var_genes]
+cor_mat <- cor(expr_corr[top_var, ], method = "pearson")
+hc      <- hclust(as.dist(1 - cor_mat), method = "average")
+ord     <- rownames(cor_mat)[hc$order]
+ 
+cor_long <- as.data.frame(cor_mat) %>%
+  mutate(s1 = rownames(.)) %>%
+  pivot_longer(-s1, names_to = "s2", values_to = "r") %>%
+  mutate(s1 = factor(s1, levels = ord), s2 = factor(s2, levels = rev(ord)))
+ 
+## coloured annotation strip for treatment
+annot <- meta %>% mutate(s1 = factor(sample, levels = ord))
+ 
+p_cor <- ggplot(cor_long, aes(s1, s2, fill = r)) +
+  geom_tile() +
+  geom_tile(data = annot, aes(x = s1, y = length(ord) + 1.2, fill = NULL,
+                              colour = NULL), fill = group_cols[as.character(annot$label)],
+            height = 1.2, inherit.aes = FALSE) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = median(cor_mat[upper.tri(cor_mat)]),
+                       name = "Pearson r") +
+  coord_equal(clip = "off") +
+  labs(x = NULL, y = NULL,
+       title = "Sample correlation (line effect removed)") +
+  theme_fig +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 5),
+        axis.text.y = element_text(size = 5),
+        axis.line = element_blank(), axis.ticks = element_blank())
+
+p_cor
+
+save_fig(p_cor, "Fig1E_sample_correlation", 5.2, 5)
+```
+
+Remaking hallmark fgsea plot from carlos so that it is ordered and themed correctly 
+```{r}
+## ---- 0. Setup ---------------------------------------------------------------
+setwd("/restricted/projectnb/crem-trainees/Murphy_Lab/Elise/GeroScreen_Paper")
+ 
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(limma)
+  library(fgsea)
+})
+ 
+logcpm_raw <- read.csv("26_01_29_logcpm.csv", check.names = FALSE,
+                       stringsAsFactors = FALSE)
+ 
+annot_cols  <- c("gene_key", "gene_id", "symbol", "feature_name",
+                 "Length", "gene_biotype")
+sample_cols <- setdiff(colnames(logcpm_raw), annot_cols)
+ 
+out_dir <- "Fig1_fgsea"
+dir.create(out_dir, showWarnings = FALSE)
+ 
+base_font <- "sans"
+ 
+## If msigdbr can't be used on the SCC, download the Hallmark GMT
+## (h.all.v*.Hs.symbols.gmt) from MSigDB into this folder and set its name here.
+hallmark_gmt <- "h.all.v2024.1.Hs.symbols.gmt"
+ 
+set.seed(2026)  # fgsea permutations
+ 
+## ---- 1. Sample metadata -----------------------------------------------------
+group_levels <- c("CTRL", "RUT", "SIT", "GEN", "EBS", "CAL", "PI", "TRA", "RAP")
+full_names   <- c(CTRL = "Vehicle", RUT = "Rutin", SIT = "Sitagliptin",
+                  GEN = "Genistein", EBS = "Ebselen", CAL = "Calpeptin",
+                  PI = "PI-103", TRA = "Trametinib", RAP = "Rapamycin")
+treatments   <- setdiff(group_levels, "CTRL")
+ 
+meta <- data.frame(sample = sample_cols, stringsAsFactors = FALSE) %>%
+  mutate(line  = factor(sub("_.*$", "", sample)),
+         cond  = sub("^[^_]+_", "", sample),
+         group = factor(sub("[0-9]+$", "", cond), levels = group_levels))
+stopifnot(!any(is.na(meta$group)))
+ 
+group_cols <- setNames(c("grey55", "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+                         "#0072B2", "#D55E00", "#CC79A7", "#000000"),
+                       full_names[group_levels])
+ 
+## ---- 2. Expression matrix (one row per gene symbol) ------------------------
+expr_df <- logcpm_raw %>%
+  filter(!is.na(symbol), symbol != "") %>%
+  mutate(row_mean = rowMeans(across(all_of(sample_cols)))) %>%
+  group_by(symbol) %>%
+  slice_max(row_mean, n = 1, with_ties = FALSE) %>%
+  ungroup()
+ 
+expr <- as.matrix(expr_df[, meta$sample])
+rownames(expr) <- expr_df$symbol
+ 
+## ---- 3. Expected pathway effects (matches Table 1) ---------------------------
+## direction: +1 = expected enrichment (NES > 0), -1 = expected depletion
+expected <- tribble(
+  ~treatment, ~pathway,                             ~direction,
+  "RUT", "HALLMARK_INFLAMMATORY_RESPONSE",              -1,
+  "RUT", "HALLMARK_REACTIVE_OXYGEN_SPECIES_PATHWAY",    -1,
+  "RUT", "HALLMARK_TNFA_SIGNALING_VIA_NFKB",            -1,
+  "SIT", "HALLMARK_IL6_JAK_STAT3_SIGNALING",            -1,
+  "SIT", "HALLMARK_INFLAMMATORY_RESPONSE",              -1,
+  "SIT", "HALLMARK_TNFA_SIGNALING_VIA_NFKB",            -1,
+  "GEN", "HALLMARK_ESTROGEN_RESPONSE_EARLY",             1,
+  "EBS", "HALLMARK_OXIDATIVE_PHOSPHORYLATION",           1,
+  "EBS", "HALLMARK_REACTIVE_OXYGEN_SPECIES_PATHWAY",    -1,
+  "EBS", "HALLMARK_UNFOLDED_PROTEIN_RESPONSE",          -1,
+  "CAL", "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",  -1,
+  "PI",  "HALLMARK_MTORC1_SIGNALING",                   -1,
+  "PI",  "HALLMARK_PI3K_AKT_MTOR_SIGNALING",            -1,
+  "PI",  "HALLMARK_APOPTOSIS",                          -1,
+  "TRA", "HALLMARK_KRAS_SIGNALING_UP",                  -1,
+  "TRA", "HALLMARK_MYC_TARGETS_V1",                     -1,
+  "TRA", "HALLMARK_TNFA_SIGNALING_VIA_NFKB",            -1,
+  "RAP", "HALLMARK_MTORC1_SIGNALING",                   -1
+)
+ 
+## Readable labels, same wording as Table 1
+pathway_labels <- c(
+  HALLMARK_INFLAMMATORY_RESPONSE             = "Inflammatory response",
+  HALLMARK_REACTIVE_OXYGEN_SPECIES_PATHWAY   = "Reactive oxygen species pathway",
+  HALLMARK_TNFA_SIGNALING_VIA_NFKB           = "TNF\u03b1 signaling via NF-\u03baB",
+  HALLMARK_IL6_JAK_STAT3_SIGNALING           = "IL6\u2013JAK\u2013STAT3 signaling",
+  HALLMARK_ESTROGEN_RESPONSE_EARLY           = "Estrogen response (early)",
+  HALLMARK_OXIDATIVE_PHOSPHORYLATION         = "Oxidative phosphorylation",
+  HALLMARK_UNFOLDED_PROTEIN_RESPONSE         = "Unfolded protein response",
+  HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION = "Epithelial\u2013mesenchymal transition",
+  HALLMARK_MTORC1_SIGNALING                  = "mTORC1 signaling",
+  HALLMARK_PI3K_AKT_MTOR_SIGNALING           = "PI3K\u2013AKT\u2013mTOR signaling",
+  HALLMARK_APOPTOSIS                         = "Apoptosis",
+  HALLMARK_KRAS_SIGNALING_UP                 = "KRAS signaling",
+  HALLMARK_MYC_TARGETS_V1                    = "MYC targets"
+)
+ 
+## ---- 4. Hallmark gene sets ----------------------------------------------------
+hallmark <- tryCatch({
+  hs <- tryCatch(msigdbr::msigdbr(species = "Homo sapiens", collection = "H"),
+                 error = function(e)
+                   msigdbr::msigdbr(species = "Homo sapiens", category = "H"))
+  split(hs$gene_symbol, hs$gs_name)
+}, error = function(e) {
+  if (!file.exists(hallmark_gmt))
+    stop("msigdbr unavailable and '", hallmark_gmt, "' not found. ",
+         "Download the Hallmark GMT from MSigDB into the working directory.")
+  message("Using local GMT: ", hallmark_gmt)
+  gmtPathways(hallmark_gmt)
+})
+hallmark <- lapply(hallmark, unique)
+stopifnot(all(expected$pathway %in% names(hallmark)))
+ 
+## ---- 5. limma statistics used for ranking -----------------------------------
+## Pooled: each treatment vs vehicle, blocked on line
+design <- model.matrix(~ 0 + group + line, data = meta)
+colnames(design) <- make.names(sub("^group", "", colnames(design)))
+contr <- makeContrasts(contrasts = paste0(make.names(treatments), " - CTRL"),
+                       levels = design)
+colnames(contr) <- treatments
+fit_pooled <- eBayes(contrasts.fit(lmFit(expr, design), contr),
+                     trend = TRUE, robust = TRUE)
+ 
+## Per line: each treatment vs vehicle within BU6 and within BU8
+meta$line_group <- factor(paste(meta$line, meta$group, sep = "_"))
+design_l <- model.matrix(~ 0 + line_group, data = meta)
+colnames(design_l) <- sub("^line_group", "", colnames(design_l))
+line_contrasts <- unlist(lapply(levels(meta$line), function(l)
+  paste0(l, "_", treatments, " - ", l, "_CTRL")))
+contr_l <- makeContrasts(contrasts = line_contrasts, levels = design_l)
+colnames(contr_l) <- sub(" - .*$", "", line_contrasts)
+fit_line <- eBayes(contrasts.fit(lmFit(expr, design_l), contr_l),
+                   trend = TRUE, robust = TRUE)
+ 
+## Ranked lists: moderated t for every treatment x column
+rank_list <- list()
+for (tx in treatments) {
+  rank_list[[paste0(tx, "|BU6")]]    <- fit_line$t[, paste0("BU6_", tx)]
+  rank_list[[paste0(tx, "|BU8")]]    <- fit_line$t[, paste0("BU8_", tx)]
+  rank_list[[paste0(tx, "|Pooled")]] <- fit_pooled$t[, tx]
+}
+ 
+## ---- 6. fGSEA -------------------------------------------------------------------
+## All 50 Hallmark sets per contrast, so padj is corrected across the full
+## Hallmark collection (not only the plotted sets).
+fgsea_all <- bind_rows(lapply(names(rank_list), function(nm) {
+  stats <- sort(rank_list[[nm]], decreasing = TRUE)
+  res <- fgsea(pathways = hallmark, stats = stats, minSize = 15, maxSize = 500)
+  parts <- strsplit(nm, "|", fixed = TRUE)[[1]]
+  as.data.frame(res) %>%
+    select(pathway, NES, pval, padj, size) %>%
+    mutate(treatment = parts[1], column = parts[2])
+}))
+write.csv(fgsea_all, file.path(out_dir, "fgsea_all_hallmarks.csv"), row.names = FALSE)
+ 
+## ---- 7. Expected-pathway results --------------------------------------------
+col_levels <- c("BU6", "BU8", "Pooled")
+ 
+plot_df <- expected %>%
+  left_join(fgsea_all, by = c("treatment", "pathway")) %>%
+  mutate(concordant = sign(NES) == direction,
+         shape_lab  = ifelse(concordant, "Concordant", "Discordant"),
+         sig        = padj < 0.05,
+         neglog_p   = -log10(padj),
+         compound   = factor(full_names[treatment], levels = full_names[treatments]),
+         pathway_lab = paste0(ifelse(direction > 0, "\u2191 ", "\u2193 "),
+                              pathway_labels[pathway]),
+         column     = factor(column, levels = col_levels))
+ 
+## Row order within each compound follows the expected table. The y key is
+## unique per compound (e.g. "RUT|..."), so shared pathway names like TNFa
+## keep the Table 1 order in every panel; the prefix is stripped for display.
+row_keys <- rev(paste(expected$treatment, expected$pathway, sep = "|"))
+plot_df <- plot_df %>%
+  mutate(row_key = factor(paste(treatment, pathway, sep = "|"), levels = row_keys))
+key_to_label <- setNames(as.character(plot_df$pathway_lab), as.character(plot_df$row_key))
+ 
+write.csv(plot_df %>%
+            select(treatment, compound, pathway, direction, column,
+                   NES, pval, padj, size, concordant),
+          file.path(out_dir, "fgsea_expected_pathways.csv"), row.names = FALSE)
+ 
+## ---- 8. Figure ------------------------------------------------------------------
+nes_lim <- ceiling(max(abs(plot_df$NES), na.rm = TRUE) * 2) / 2
+ 
+theme_fig <- theme_classic(base_size = 9, base_family = base_font) +
+  theme(axis.text          = element_text(colour = "black"),
+        axis.line          = element_blank(),
+        axis.ticks.y       = element_blank(),
+        panel.border       = element_rect(fill = NA, colour = "grey40", linewidth = 0.4),
+        panel.grid.major   = element_line(colour = "grey92", linewidth = 0.3),
+        strip.placement    = "outside",
+        strip.background.y = element_rect(colour = "grey40", linewidth = 0.4),
+        strip.text.y.left  = element_text(angle = 0, face = "bold",
+                                          margin = margin(0, 5, 0, 5)),
+        strip.switch.pad.grid = unit(3, "pt"),
+        panel.spacing.y    = unit(3, "pt"),
+        legend.key.size    = unit(0.35, "cm"),
+        plot.title         = element_text(face = "bold", size = 10),
+        plot.title.position = "plot")
+ 
+p_fgsea <- ggplot(plot_df, aes(column, row_key)) +
+  geom_point(aes(size = neglog_p, fill = NES, shape = shape_lab,
+                 stroke = ifelse(sig, 0.8, 0.3),
+                 colour = ifelse(sig, "black", "grey45"))) +
+  scale_shape_manual(values = c(Concordant = 21, Discordant = 24),
+                     name = "Expected direction") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, limits = c(-nes_lim, nes_lim), name = "NES") +
+  scale_size_continuous(range = c(1.5, 6), breaks = c(1, 2, 5, 10),
+                        limits = c(0, NA), name = expression(-log[10]~adj.~p)) +
+  scale_colour_identity() +
+  scale_y_discrete(labels = function(k) key_to_label[k]) +
+  facet_grid(compound ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  labs(x = NULL, y = NULL,
+       title = "Hallmark fGSEA: validation of expected drug activity",
+       subtitle = "Arrow = predicted direction; black outline = adj. p < 0.05") +
+  guides(shape = guide_legend(override.aes = list(size = 3, fill = "grey80")),
+         size  = guide_legend(override.aes = list(shape = 21, fill = "grey80"))) +
+  theme_fig
+ 
+## Fill each compound's strip box with its colour. ggplot can't colour strips
+## individually, so the strips are recoloured after the plot is built.
+## The helper searches each strip for its background rectangle and label text,
+## so it works regardless of how a given ggplot2 version nests the strip.
+## Black text on light colours, white text on dark colours.
+light_bg <- c("Rutin", "Sitagliptin", "Genistein", "Ebselen", "Trametinib")
+ 
+recolour_strip <- function(grob, fill, text_col) {
+  if (inherits(grob, "rect")) {
+    gp <- if (is.null(grob$gp)) grid::gpar() else grob$gp
+    gp$fill <- fill
+    grob$gp <- gp
+  } else if (inherits(grob, "text")) {
+    gp <- if (is.null(grob$gp)) grid::gpar() else grob$gp
+    gp$col <- text_col
+    grob$gp <- gp
+  }
+  if (!is.null(grob$grobs))
+    grob$grobs <- lapply(grob$grobs, recolour_strip, fill = fill, text_col = text_col)
+  if (!is.null(grob$children)) {
+    for (nm in seq_along(grob$children))
+      grob$children[[nm]] <- recolour_strip(grob$children[[nm]],
+                                            fill = fill, text_col = text_col)
+  }
+  grob
+}
+ 
+## Build the grob on a cairo device (the same one used for saving) so label
+## widths with the arrows and Greek letters are measured correctly
+cairo_pdf(tmp_pdf <- tempfile(fileext = ".pdf"), width = 7, height = 6.5)
+g <- ggplotGrob(p_fgsea)
+invisible(dev.off()); unlink(tmp_pdf)
+ 
+strip_idx <- grep("^strip-l", g$layout$name)
+strip_idx <- strip_idx[order(g$layout$t[strip_idx])]          # top to bottom
+compounds_in_order <- levels(droplevels(plot_df$compound))
+stopifnot(length(strip_idx) == length(compounds_in_order))
+ 
+for (k in seq_along(strip_idx)) {
+  cmp <- compounds_in_order[k]
+  g$grobs[[strip_idx[k]]] <- recolour_strip(
+    g$grobs[[strip_idx[k]]],
+    fill     = unname(group_cols[cmp]),
+    text_col = if (cmp %in% light_bg) "black" else "white")
+}
+ 
+## To view in RStudio, draw the recoloured grob (printing p_fgsea shows the
+## plain, uncoloured version)
+if (interactive()) {
+  grid::grid.newpage()
+  grid::grid.draw(g)
+}
+ 
+## Save the recoloured grob directly with grid (ggsave can refuse objects that
+## aren't ggplots in newer ggplot2 versions). Cairo for both, so text is sized
+## exactly as measured above. A plain, uncoloured backup is saved if the
+## coloured version fails for any reason.
+save_grob <- function(grob, name, w, h) {
+  png(file.path(out_dir, paste0(name, ".png")), width = w, height = h,
+      units = "in", res = 600, type = "cairo")
+  grid::grid.newpage(); grid::grid.draw(grob)
+  invisible(dev.off())
+  cairo_pdf(file.path(out_dir, paste0(name, ".pdf")), width = w, height = h)
+  grid::grid.newpage(); grid::grid.draw(grob)
+  invisible(dev.off())
+}
+ 
+tryCatch({
+  save_grob(g, "Fig1_fgsea_validation", 7, 6.5)
+  message("Saved: ", file.path(out_dir, "Fig1_fgsea_validation.png/.pdf"))
+}, error = function(e) {
+  while (dev.cur() > 1) dev.off()
+  message("Coloured version failed (", conditionMessage(e),
+          "); saving uncoloured version instead.")
+  save_grob(ggplotGrob(p_fgsea), "Fig1_fgsea_validation_uncoloured", 7, 6.5)
+})
+```
+
+making a small figure to explore tramatenib more 
+
+```{r}
+## ---- 0. Setup ---------------------------------------------------------------
+setwd("/restricted/projectnb/crem-trainees/Murphy_Lab/Elise/GeroScreen_Paper")
+ 
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(limma)
+  library(fgsea)
+})
+ 
+logcpm_raw <- read.csv("26_01_29_logcpm.csv", check.names = FALSE,
+                       stringsAsFactors = FALSE)
+ 
+annot_cols  <- c("gene_key", "gene_id", "symbol", "feature_name",
+                 "Length", "gene_biotype")
+sample_cols <- setdiff(colnames(logcpm_raw), annot_cols)
+ 
+out_dir <- "Fig1_trametinib"
+dir.create(out_dir, showWarnings = FALSE)
+ 
+base_font <- "sans"
+fdr_cut   <- 0.05
+tra_col   <- "#CC79A7"                          # trametinib colour in all panels
+up_col    <- "#B2182B"; down_col <- "#2166AC"   # same up/down colours as DEG panel
+ 
+## Hallmark GMT fallback if msigdbr can't be used (see fgsea script)
+hallmark_gmt <- "h.all.v2024.1.Hs.symbols.gmt"
+set.seed(2026)
+ 
+## ---- 1. Sample metadata and expression (one row per gene symbol) -------------
+group_levels <- c("CTRL", "RUT", "SIT", "GEN", "EBS", "CAL", "PI", "TRA", "RAP")
+ 
+meta <- data.frame(sample = sample_cols, stringsAsFactors = FALSE) %>%
+  mutate(line  = factor(sub("_.*$", "", sample)),
+         group = factor(sub("[0-9]+$", "", sub("^[^_]+_", "", sample)),
+                        levels = group_levels))
+stopifnot(!any(is.na(meta$group)))
+ 
+expr_df <- logcpm_raw %>%
+  filter(!is.na(symbol), symbol != "") %>%
+  mutate(row_mean = rowMeans(across(all_of(sample_cols)))) %>%
+  group_by(symbol) %>%
+  slice_max(row_mean, n = 1, with_ties = FALSE) %>%
+  ungroup()
+expr <- as.matrix(expr_df[, meta$sample])
+rownames(expr) <- expr_df$symbol
+ 
+## ---- 2. Trametinib vs vehicle (same pooled limma model as other panels) -----
+design <- model.matrix(~ 0 + group + line, data = meta)
+colnames(design) <- make.names(sub("^group", "", colnames(design)))
+contr <- makeContrasts(TRA = TRA - CTRL, levels = design)
+fit_tra <- eBayes(contrasts.fit(lmFit(expr, design), contr),
+                  trend = TRUE, robust = TRUE)
+ 
+tra_de <- topTable(fit_tra, coef = "TRA", number = Inf, sort.by = "none") %>%
+  mutate(gene = rownames(.),
+         status = case_when(adj.P.Val < fdr_cut & logFC > 0 ~ "Up",
+                            adj.P.Val < fdr_cut & logFC < 0 ~ "Down",
+                            TRUE ~ "NS"))
+write.csv(tra_de, file.path(out_dir, "TRA_limma_vs_vehicle.csv"), row.names = FALSE)
+ 
+## MEK-ERK transcriptional targets (MPAS genes; Wagle et al. 2018)
+mpas_genes <- c("PHLDA1", "SPRY2", "SPRY4", "DUSP4", "DUSP6",
+                "CCND1", "EPHA2", "EPHA4", "ETV4", "ETV5")
+ 
+## ---- 3. Hallmark fGSEA for trametinib -----------------------------------------
+hallmark <- tryCatch({
+  hs <- tryCatch(msigdbr::msigdbr(species = "Homo sapiens", collection = "H"),
+                 error = function(e)
+                   msigdbr::msigdbr(species = "Homo sapiens", category = "H"))
+  split(hs$gene_symbol, hs$gs_name)
+}, error = function(e) {
+  if (!file.exists(hallmark_gmt))
+    stop("msigdbr unavailable and '", hallmark_gmt, "' not found.")
+  gmtPathways(hallmark_gmt)
+})
+hallmark <- lapply(hallmark, unique)
+ 
+tra_stats <- sort(setNames(tra_de$t, tra_de$gene), decreasing = TRUE)
+tra_gsea  <- as.data.frame(fgsea(hallmark, tra_stats, minSize = 15, maxSize = 500)) %>%
+  select(pathway, NES, pval, padj, size) %>%
+  arrange(desc(NES))
+write.csv(tra_gsea, file.path(out_dir, "TRA_fgsea_hallmark.csv"), row.names = FALSE)
+ 
+## Tidy Hallmark names: "HALLMARK_TNFA_SIGNALING_VIA_NFKB" -> "TNFa signaling via NF-kB"
+clean_hallmark <- function(x) {
+  x <- sub("^HALLMARK_", "", x)
+  x <- gsub("_", " ", x)
+  x <- tolower(x)
+  fixes <- c("tnfa" = "TNF\u03b1", "nfkb" = "NF-\u03baB", "kras" = "KRAS",
+             "myc" = "MYC", "mtorc1" = "mTORC1", "pi3k akt mtor" = "PI3K\u2013AKT\u2013mTOR",
+             "il6 jak stat3" = "IL6\u2013JAK\u2013STAT3", "il2 stat5" = "IL2\u2013STAT5",
+             "e2f" = "E2F", "g2m" = "G2M", "dna" = "DNA", "uv" = "UV",
+             "tgf beta" = "TGF-\u03b2", "wnt beta catenin" = "WNT/\u03b2-catenin",
+             "kras signaling up" = "KRAS signaling (up)",
+             "kras signaling dn" = "KRAS signaling (down)",
+             "interferon alpha" = "IFN-\u03b1", "interferon gamma" = "IFN-\u03b3",
+             "p53" = "p53", "tnfa signaling via nfkb" = "TNF\u03b1 signaling via NF-\u03baB",
+             "epithelial mesenchymal transition" = "Epithelial\u2013mesenchymal transition",
+             "unfolded protein response" = "Unfolded protein response")
+  for (k in names(fixes)[order(-nchar(names(fixes)))])
+    x <- sub(paste0("^", k, "$"), fixes[[k]], x)
+  x <- gsub("\\bil2 stat5\\b", "IL2\u2013STAT5", x, perl = TRUE)
+  x <- gsub("\\bil6 jak stat3\\b", "IL6\u2013JAK\u2013STAT3", x, perl = TRUE)
+  for (k in c("tnfa", "nfkb", "kras", "myc", "mtorc1", "e2f", "g2m", "dna", "uv"))
+    x <- gsub(paste0("\\b", k, "\\b"), fixes[[k]], x, perl = TRUE)
+  paste0(toupper(substr(x, 1, 1)), substr(x, 2, nchar(x)))
+}
+ 
+## ---- 4. Shared theme (matches panels b-d) -------------------------------------
+theme_fig <- theme_classic(base_size = 9, base_family = base_font) +
+  theme(axis.text        = element_text(colour = "black"),
+        axis.line        = element_line(linewidth = 0.4),
+        axis.ticks       = element_line(linewidth = 0.4),
+        legend.key.size  = unit(0.3, "cm"),
+        plot.title       = element_text(face = "bold", size = 10),
+        plot.subtitle    = element_text(size = 7),
+        plot.title.position = "plot")
+ 
+## ---- 5. Panel e: volcano with MEK-ERK targets labelled ------------------------
+n_up   <- sum(tra_de$status == "Up")
+n_down <- sum(tra_de$status == "Down")
+lab_df <- tra_de %>% filter(gene %in% mpas_genes)
+ 
+p_volcano <- ggplot(tra_de, aes(logFC, -log10(P.Value))) +
+  geom_point(data = filter(tra_de, status == "NS"),
+             colour = "grey80", size = 0.4) +
+  geom_point(data = filter(tra_de, status != "NS"),
+             aes(colour = status), size = 0.5, alpha = 0.6) +
+  geom_point(data = lab_df, shape = 21, fill = tra_col, colour = "black",
+             size = 1.8, stroke = 0.4) +
+  scale_colour_manual(values = c(Up = up_col, Down = down_col), guide = "none") +
+  labs(x = expression(log[2]*FC~(trametinib~vs~vehicle)),
+       y = expression(-log[10]~p),
+       title = "Trametinib vs vehicle",
+       subtitle = sprintf("%d down, %d up (FDR < %.2f)\nMEK\u2013ERK target genes labelled",
+                          n_down, n_up, fdr_cut)) +
+  theme_fig
+ 
+if (requireNamespace("ggrepel", quietly = TRUE)) {
+  p_volcano <- p_volcano +
+    ggrepel::geom_text_repel(data = lab_df, aes(label = gene), size = 2.4,
+                             family = base_font, fontface = "italic",
+                             min.segment.length = 0, segment.size = 0.25,
+                             box.padding = 0.3, max.overlaps = Inf, seed = 1)
+} else {
+  p_volcano <- p_volcano +
+    geom_text(data = lab_df, aes(label = gene), size = 2.4, vjust = -0.8,
+              family = base_font, fontface = "italic")
+}
+ 
+## ---- 6. Panel f: top Hallmark pathways --------------------------------------------
+n_show <- 5   # pathways shown in each direction
+nes_df <- bind_rows(
+  tra_gsea %>% filter(padj < fdr_cut, NES > 0) %>% slice_max(NES, n = n_show),
+  tra_gsea %>% filter(padj < fdr_cut, NES < 0) %>% slice_min(NES, n = n_show)
+) %>%
+  mutate(label = clean_hallmark(pathway),
+         label = factor(label, levels = label[order(NES)]),
+         dir   = ifelse(NES > 0, "Up", "Down"))
+ 
+p_nes <- ggplot(nes_df, aes(NES, label, fill = dir)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, linewidth = 0.4) +
+  scale_fill_manual(values = c(Up = up_col, Down = down_col), guide = "none") +
+  labs(x = "NES", y = NULL, title = "Top Hallmark pathways") +
+  theme_fig +
+  theme(axis.ticks.y = element_blank())
+ 
+## ---- 7. Save (cairo for PNG and PDF) ---------------------------------------------
+save_fig <- function(p, name, w, h) {
+  ggsave(file.path(out_dir, paste0(name, ".png")), p, width = w, height = h,
+         units = "in", dpi = 600, device = png, type = "cairo")
+  ggsave(file.path(out_dir, paste0(name, ".pdf")), p, width = w, height = h,
+         units = "in", device = cairo_pdf)
+}
+save_fig(p_volcano, "Fig1e_TRA_volcano",      2.6, 2.4)
+save_fig(p_nes,     "Fig1f_TRA_hallmark_NES", 2.8, 2.4)
+ 
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  library(patchwork)
+  p_combined <- p_volcano + p_nes + plot_layout(widths = c(1, 1))
+  save_fig(p_combined, "Fig1ef_TRA_combined", 5.4, 2.4)
+}
+ 
+```
+
+making volcano plots of each compound for supplementary figure 
+```{r}
+setwd("/restricted/projectnb/crem-trainees/Murphy_Lab/Elise/GeroScreen_Paper")
+ 
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(limma)
+})
+ 
+logcpm_raw <- read.csv("26_01_29_logcpm.csv", check.names = FALSE,
+                       stringsAsFactors = FALSE)
+ 
+annot_cols  <- c("gene_key", "gene_id", "symbol", "feature_name",
+                 "Length", "gene_biotype")
+sample_cols <- setdiff(colnames(logcpm_raw), annot_cols)
+ 
+out_dir <- "FigS_volcanoes"
+dir.create(out_dir, showWarnings = FALSE)
+ 
+base_font <- "sans"
+fdr_cut   <- 0.05
+up_col    <- "#B2182B"; down_col <- "#2166AC"   # same as DEG panel and Fig 1e
+n_label   <- 3       # top significant genes labelled in each direction per panel
+same_axes <- TRUE    # TRUE = identical axes in every panel (effect sizes comparable)
+                     # FALSE = each panel scaled to its own data
+group_levels <- c("CTRL", "RUT", "SIT", "GEN", "EBS", "CAL", "PI", "TRA", "RAP")
+full_names   <- c(RUT = "Rutin", SIT = "Sitagliptin", GEN = "Genistein",
+                  EBS = "Ebselen", CAL = "Calpeptin", PI = "PI-103",
+                  TRA = "Trametinib", RAP = "Rapamycin")
+treatments   <- setdiff(group_levels, "CTRL")
+ 
+meta <- data.frame(sample = sample_cols, stringsAsFactors = FALSE) %>%
+  mutate(line  = factor(sub("_.*$", "", sample)),
+         group = factor(sub("[0-9]+$", "", sub("^[^_]+_", "", sample)),
+                        levels = group_levels))
+stopifnot(!any(is.na(meta$group)))
+ 
+expr_df <- logcpm_raw %>%
+  filter(!is.na(symbol), symbol != "") %>%
+  mutate(row_mean = rowMeans(across(all_of(sample_cols)))) %>%
+  group_by(symbol) %>%
+  slice_max(row_mean, n = 1, with_ties = FALSE) %>%
+  ungroup()
+expr <- as.matrix(expr_df[, meta$sample])
+rownames(expr) <- expr_df$symbol
+## ---- 2. limma: each compound vs vehicle, blocked on line ----------------------
+design <- model.matrix(~ 0 + group + line, data = meta)
+colnames(design) <- make.names(sub("^group", "", colnames(design)))
+contr <- makeContrasts(contrasts = paste0(make.names(treatments), " - CTRL"),
+                       levels = design)
+colnames(contr) <- treatments
+fit <- eBayes(contrasts.fit(lmFit(expr, design), contr), trend = TRUE, robust = TRUE)
+ 
+de_all <- bind_rows(lapply(treatments, function(tx) {
+  topTable(fit, coef = tx, number = Inf, sort.by = "none") %>%
+    mutate(gene = rownames(.), treatment = tx)
+})) %>%
+  mutate(compound = factor(full_names[treatment], levels = full_names[treatments]),
+         status   = case_when(adj.P.Val < fdr_cut & logFC > 0 ~ "Up",
+                              adj.P.Val < fdr_cut & logFC < 0 ~ "Down",
+                              TRUE ~ "NS"),
+         neglog_p = -log10(P.Value))
+write.csv(de_all %>% select(compound, gene, logFC, AveExpr, t, P.Value, adj.P.Val, status),
+          file.path(out_dir, "limma_all_compounds_vs_vehicle.csv"), row.names = FALSE)
+ 
+## ---- 3. Labels and DEG counts per panel -----------------------------------------
+lab_df <- de_all %>%
+  filter(status != "NS") %>%
+  group_by(compound, status) %>%
+  slice_min(P.Value, n = n_label, with_ties = FALSE) %>%
+  ungroup()
+ 
+count_df <- de_all %>%
+  group_by(compound) %>%
+  summarise(n_up = sum(status == "Up"), n_down = sum(status == "Down"),
+            .groups = "drop")
+ 
+## ---- 4. Plot ----------------------------------------------------------------------
+theme_fig <- theme_classic(base_size = 9, base_family = base_font) +
+  theme(axis.text        = element_text(colour = "black"),
+        axis.line        = element_line(linewidth = 0.4),
+        axis.ticks       = element_line(linewidth = 0.4),
+        strip.background = element_blank(),
+        strip.text       = element_text(face = "bold", size = 9),
+        panel.border     = element_rect(fill = NA, linewidth = 0.4),
+        panel.spacing    = unit(6, "pt"),
+        plot.title       = element_text(face = "bold", size = 10),
+        plot.subtitle    = element_text(size = 7),
+        plot.title.position = "plot")
+ 
+p_volc <- ggplot(de_all, aes(logFC, neglog_p)) +
+  geom_point(data = filter(de_all, status == "NS"),
+             colour = "grey80", size = 0.3) +
+  geom_point(data = filter(de_all, status != "NS"),
+             aes(colour = status), size = 0.4, alpha = 0.6) +
+  geom_text(data = count_df, aes(x = -Inf, y = Inf, label = paste0(n_down, " down")),
+            hjust = -0.1, vjust = 1.4, size = 2.3, colour = down_col,
+            family = base_font, inherit.aes = FALSE) +
+  geom_text(data = count_df, aes(x = Inf, y = Inf, label = paste0(n_up, " up")),
+            hjust = 1.1, vjust = 1.4, size = 2.3, colour = up_col,
+            family = base_font, inherit.aes = FALSE) +
+  facet_wrap(~ compound, nrow = 4, ncol = 2,
+             scales = if (same_axes) "fixed" else "free") +
+  scale_colour_manual(values = c(Up = up_col, Down = down_col), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+  labs(x = expression(log[2]*FC~vs~vehicle), y = expression(-log[10]~p),
+       title = "Differential expression for each compound vs vehicle",
+       subtitle = sprintf("limma, blocked on cell line; coloured = FDR < %.2f; top %d genes per direction labelled",
+                          fdr_cut, n_label)) +
+  theme_fig
+ 
+if (requireNamespace("ggrepel", quietly = TRUE)) {
+  p_volc <- p_volc +
+    ggrepel::geom_text_repel(data = lab_df, aes(label = gene), size = 2,
+                             family = base_font, fontface = "italic",
+                             min.segment.length = 0, segment.size = 0.2,
+                             box.padding = 0.25, max.overlaps = Inf, seed = 1)
+} else {
+  p_volc <- p_volc +
+    geom_text(data = lab_df, aes(label = gene), size = 2, vjust = -0.7,
+              family = base_font, fontface = "italic")
+}
+ 
+## ---- 5. Save (cairo for PNG and PDF) ---------------------------------------------
+save_fig <- function(p, name, w, h) {
+  ggsave(file.path(out_dir, paste0(name, ".png")), p, width = w, height = h,
+         units = "in", dpi = 600, device = png, type = "cairo")
+  ggsave(file.path(out_dir, paste0(name, ".pdf")), p, width = w, height = h,
+         units = "in", device = cairo_pdf)
+}
+save_fig(p_volc, "FigS_volcanoes_all_compounds", 5.5, 8.5)
+ 
+## ---- 6. Session info ----------------------------------------------------------
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+message("Done. Outputs written to: ", normalizePath(out_dir))
+ 
+```
+
+
