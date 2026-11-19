@@ -16,7 +16,7 @@ psychad_pseudobulk.py : Builds excitatory-neuron pseudobulk from the PscyhAD atl
 
 psychad_EN_age_signature.R : Derives the PsychAD aging signature used in subsequent comparisons 
 
-Data: RNA-seq data are available at __________
+Data: RNA-seq data are available  on GEO under repository number GSE354186
 
 Contact:
 Elise MacDonald, Murphy Laboratory, Center for Regenerative Medicine (CReM), Boston University 
